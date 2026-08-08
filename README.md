@@ -1,3 +1,6 @@
+# Link
+https://www.youtube.com/watch?v=PqMmDw0k2n4
+
 # Quantum-Enhanced Physics-Informed Learning for a 1-D Navier–Stokes Shock Tube
 
 This repository compares classical computational fluid dynamics (CFD), classical neural networks, physics-informed neural networks (PINNs), quantum PINNs (QPINNs), and quantum-augmented PINNs (QAPINNs) on a viscous one-dimensional shock-tube problem.
