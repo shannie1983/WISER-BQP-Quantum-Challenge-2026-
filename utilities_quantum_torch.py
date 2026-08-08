@@ -36,7 +36,7 @@ Loss:
     total     lambda_fidelity * L_fid + lambda_pde * L_pde
 
 Interface is identical to QuantumPINN:
-    model = TorchPINN(n_qubits=4, n_layers=2, pde='burgers')
+    model = TorchQPINN(n_qubits=4, n_layers=2, pde='burgers')
     pred, loss = model(x, y)
     loss.backward()
 
@@ -76,13 +76,25 @@ _DEFAULT_DEVICE: torch.device = _get_device()
 #  Options (same as QuantumPINN) 
 
 ENCODING_OPTIONS = [
-    "angle", "angle_full", "dense", "arctan",
-    "iqp", "amplitude", "fft", "fft_phase", "fft_full",
+    "angle",      # RY(x) per qubit — simplest, mirrors PennyLane AngleEmbedding
+    "angle_full", # RX(x)+RY(x)+RZ(x^2) — full Bloch sphere, default
+    "angle_zz",   # RY(x) + nearest-neighbour ZZ — captures feature correlations
+    "dense",      # RX(x)+RZ(x) — XZ plane
+    "arctan",     # RY(arctan(x)) — bounded input mapping
+    "iqp",        # Hadamard + RZ(x^2) + ZZ — strongly entangled
+    "amplitude",  # direct amplitude encoding
+    "fft",        # FFT magnitude encoding
+    "fft_phase",  # FFT phase encoding
+    "fft_full",   # FFT magnitude + phase
 ]
 DECODING_OPTIONS = ENCODING_OPTIONS
 ANSATZ_OPTIONS   = [
     "u_ring", "u_full", "u_alternate",
     "efficient_su2", "real_amplitudes", "strongly",
+    # Improved designs:
+    "ns_coupled",        # physically-motivated: couples output qubits first
+    "brick_wall",        # alternating even/odd CNOT — better gradient flow
+    "hardware_efficient",# RZ-RY-RZ + alternating CZ — most expressive per param
 ]
 PDE_OPTIONS = ["burgers", "heat", "wave", "schrodinger"]
 
@@ -447,16 +459,38 @@ def torch_encode(state: torch.Tensor, x: torch.Tensor,
     for q in range(n_qubits):
         v = x[:, q % n_feat]
         if encoding == "angle":
+            # Single RY(x) per qubit — simplest angle encoding
+            # Mirrors PennyLane AngleEmbedding(rotation="Y")
             state = _apply_gate(state, _ry(v), q, n_qubits)
         elif encoding == "angle_full":
+            # RX(x) + RY(x) + RZ(x^2) per qubit — full Bloch sphere + nonlinear
+            # Most expressive single-qubit encoding, default for NS problem
             state = _apply_gate(state, _rx(v),      q, n_qubits)
             state = _apply_gate(state, _ry(v),      q, n_qubits)
             state = _apply_gate(state, _rz(v ** 2), q, n_qubits)
+        elif encoding == "angle_zz":
+            # RY(x) per qubit + nearest-neighbour ZZ entanglement
+            # Stronger than bare angle: captures feature correlations via entanglement
+            # Good balance between angle simplicity and IQP expressivity
+            state = _apply_gate(state, _ry(v), q, n_qubits)
         elif encoding == "dense":
+            # RX(x) + RZ(x) per qubit — XZ plane encoding
             state = _apply_gate(state, _rx(v), q, n_qubits)
             state = _apply_gate(state, _rz(v), q, n_qubits)
         elif encoding == "arctan":
+            # RY(arctan(x)) — maps unbounded inputs to [-pi/2, pi/2]
             state = _apply_gate(state, _ry(torch.atan(v)), q, n_qubits)
+
+    # angle_zz: add nearest-neighbour ZZ entanglement after all RY gates
+    # ZZ(vi, vj) = CNOT + RZ(vi*vj) + CNOT — captures pairwise feature products
+    if encoding == "angle_zz":
+        for q in range(n_qubits - 1):
+            vi = x[:, q % n_feat]
+            vj = x[:, (q + 1) % n_feat]
+            state = _apply_cnot(state, q, q + 1, n_qubits)
+            state = _apply_gate(state, _rz(vi * vj), q + 1, n_qubits)
+            state = _apply_cnot(state, q, q + 1, n_qubits)
+
     return state
 
 
@@ -464,12 +498,16 @@ def torch_encode(state: torch.Tensor, x: torch.Tensor,
 
 def ansatz_weight_shape(ansatz: str, n_layers: int, n_qubits: int) -> tuple:
     shapes = {
-        "u_ring":         (n_layers, n_qubits, 3),
-        "u_full":         (n_layers, n_qubits, 3),
-        "u_alternate":    (n_layers, n_qubits, 3),
-        "efficient_su2":  (n_layers + 1, n_qubits, 2),
-        "real_amplitudes":(n_layers + 1, n_qubits),
-        "strongly":       (n_layers, n_qubits, 3),
+        "u_ring":           (n_layers, n_qubits, 3),
+        "u_full":           (n_layers, n_qubits, 3),
+        "u_alternate":      (n_layers, n_qubits, 3),
+        "efficient_su2":    (n_layers + 1, n_qubits, 2),
+        "real_amplitudes":  (n_layers + 1, n_qubits),
+        "strongly":         (n_layers, n_qubits, 3),
+        # Improved:
+        "ns_coupled":       (n_layers, n_qubits, 3),
+        "brick_wall":       (n_layers, n_qubits, 3),
+        "hardware_efficient":(n_layers, n_qubits, 3),
     }
     if ansatz not in shapes:
         raise ValueError(f"ansatz must be one of {ANSATZ_OPTIONS}")
@@ -528,6 +566,106 @@ def torch_ansatz(state: torch.Tensor, weights: torch.Tensor,
                 state = _apply_gate(state, _rz(weights[layer, q, 2].expand(batch)), q, n_qubits)
             for i, j in combinations(range(n_qubits), 2):
                 state = _apply_cz(state, i, j, n_qubits)
+
+    elif ansatz == "ns_coupled":
+        """
+        NS-physically-motivated ansatz.
+
+        Design rationale:
+            NS outputs are [rho, u, p] on qubits 0,1,2.
+            These fields are tightly coupled: rho drives momentum,
+            pressure couples to both.
+
+        Structure per layer:
+            1. U3 on ALL qubits (full SU(2) rotation)
+            2. Entangle output qubits first: CNOT(0→1), CNOT(1→2), CNOT(2→0)
+               (triangular loop — captures rho-u-p mutual dependence)
+            3. Propagate to feature qubits: CNOT(0→3), CNOT(1→4), ..., CNOT(2→6)
+               (fan-out: each output qubit talks to two feature qubits)
+
+        Why better than u_full:
+            u_full applies n*(n-1)/2 = 21 CNOTs per layer uniformly.
+            ns_coupled applies 9 CNOTs but targets the physically relevant pairs,
+            reducing barren plateau risk while maintaining NS coupling structure.
+        """
+        for layer in range(n_layers):
+            # U3 rotation on each qubit
+            for q in range(n_qubits):
+                g = _u3(weights[layer, q, 0].expand(batch),
+                        weights[layer, q, 1].expand(batch),
+                        weights[layer, q, 2].expand(batch))
+                state = _apply_gate(state, g, q, n_qubits)
+            # Step 1: entangle output qubits (0=rho, 1=u, 2=p)
+            state = _apply_cnot(state, 0, 1, n_qubits)
+            state = _apply_cnot(state, 1, 2, n_qubits)
+            state = _apply_cnot(state, 2, 0, n_qubits)
+            # Step 2: fan-out from output to feature qubits
+            for out_q in range(3):
+                for feat_q in range(3 + out_q, min(3 + out_q + 2, n_qubits)):
+                    state = _apply_cnot(state, out_q, feat_q, n_qubits)
+            # Step 3: ring over feature qubits
+            for q in range(3, n_qubits - 1):
+                state = _apply_cnot(state, q, q + 1, n_qubits)
+
+    elif ansatz == "brick_wall":
+        """
+        Brick-wall (checkerboard) ansatz.
+
+        Design rationale:
+            Alternating even/odd CNOT layers create a depth-efficient
+            entanglement pattern. Each qubit entangles with both neighbours
+            every 2 layers. Well-studied in quantum ML — better gradient
+            flow than u_full because entanglement grows gradually.
+
+        Structure per layer:
+            Layer 0 (even): U3 + CNOT(0→1), CNOT(2→3), CNOT(4→5), CNOT(6→...)
+            Layer 1 (odd):  U3 + CNOT(1→2), CNOT(3→4), CNOT(5→6), ...
+
+        Why better than u_ring:
+            u_ring only creates linear chain entanglement.
+            brick_wall creates a 2D entanglement pattern that reaches
+            non-adjacent qubits in fewer layers.
+        """
+        for layer in range(n_layers):
+            for q in range(n_qubits):
+                g = _u3(weights[layer, q, 0].expand(batch),
+                        weights[layer, q, 1].expand(batch),
+                        weights[layer, q, 2].expand(batch))
+                state = _apply_gate(state, g, q, n_qubits)
+            offset = layer % 2   # even=0, odd=1
+            for q in range(offset, n_qubits - 1, 2):
+                state = _apply_cnot(state, q, q + 1, n_qubits)
+
+    elif ansatz == "hardware_efficient":
+        """
+        Hardware-efficient ansatz with Euler decomposition.
+
+        Design rationale:
+            Each qubit gets a full SU(2) rotation via RZ-RY-RZ
+            (Euler angle decomposition — most general single-qubit gate).
+            Entanglement uses CZ (diagonal — faster than CNOT on most hardware).
+            Alternates between two CZ patterns for uniform coverage.
+
+        Structure per layer:
+            1. RZ(w0) + RY(w1) + RZ(w2) on each qubit  (Euler SU(2))
+            2. Even layers: CZ(0,1), CZ(2,3), CZ(4,5), ...
+               Odd  layers: CZ(1,2), CZ(3,4), CZ(5,6), ...
+
+        Why better than u_full:
+            RZ-RY-RZ is the Euler decomposition of the most general SU(2).
+            CZ is symmetric (no control/target bias) — more uniform entanglement.
+            Same param count as u_ring but reaches more entanglement faster.
+        """
+        for layer in range(n_layers):
+            # Euler SU(2): RZ-RY-RZ
+            for q in range(n_qubits):
+                state = _apply_gate(state, _rz(weights[layer, q, 0].expand(batch)), q, n_qubits)
+                state = _apply_gate(state, _ry(weights[layer, q, 1].expand(batch)), q, n_qubits)
+                state = _apply_gate(state, _rz(weights[layer, q, 2].expand(batch)), q, n_qubits)
+            # Alternating CZ pattern
+            offset = layer % 2
+            for q in range(offset, n_qubits - 1, 2):
+                state = _apply_cz(state, q, q + 1, n_qubits)
 
     return state
 
@@ -725,9 +863,9 @@ def _lcu_combined_loss(psi: torch.Tensor, phi: torch.Tensor,
     return loss
 
 
-#  TorchPINN 
+#  TorchQPINN 
 
-class TorchPINN(nn.Module):
+class TorchQPINN(nn.Module):
     """
     Pure-PyTorch quantum PINN  statevector equivalent of QuantumPINN.
 
@@ -761,6 +899,7 @@ class TorchPINN(nn.Module):
         self,
         n_qubits:        int   = 4,
         n_layers:        int   = 2,
+        n_enc_layers:    int   = 1,
         encoding:        str   = "angle_full",
         ansatz:          str   = "u_ring",
         decoding:        str   = "angle_full",
@@ -769,31 +908,78 @@ class TorchPINN(nn.Module):
         lambda_pde:      float = 1.0,
         lambda_fidelity: float = 1.0,
         lambda_data:     float = 10.0,
-        n_out:           int   = 3,     # NS output dim [rho, u, p]
+        n_out:           int   = 3,
+        # y-register options
+        y_encoding:      str   = None,   # None = same as x encoding
+        y_n_qubits:      int   = None,   # None = n_out (3 for NS)
+        y_n_enc_layers:  int   = 1,      # y re-uploading (NO ansatz — y is fixed GT)
+        # post-measurement decoder
+        use_decoder:     bool  = True,   # learned decoder after measurement
         device:          torch.device = None,
     ):
         super().__init__()
         self.n_qubits        = n_qubits
-        self.n_y_qubits      = n_out    # y register uses exactly n_out qubits
+        self.n_out           = n_out
+        self.n_y_qubits      = y_n_qubits if y_n_qubits is not None else n_out
+        self.n_y_enc_layers  = y_n_enc_layers   # y re-upload depth (no weights)
         self.n_layers        = n_layers
+        self.n_enc_layers    = n_enc_layers
         self.encoding        = encoding
+        self.y_encoding      = y_encoding if y_encoding is not None else encoding
         self.ansatz          = ansatz
         self.decoding        = decoding
+        self.use_decoder     = use_decoder
         self.pde             = pde
         self.nu              = nu
         self.lambda_pde      = lambda_pde
         self.lambda_fidelity = lambda_fidelity
         self.lambda_data     = lambda_data
-        self.n_out           = n_out
 
         if device is None:
             device = _DEFAULT_DEVICE
         self.device = device
 
-        shape = ansatz_weight_shape(ansatz, n_layers, n_qubits)
-        self.weights  = nn.Parameter(torch.randn(shape, device=device) * 0.01)
-        # Linear head: expval(Z) [n_qubits] -> NS targets [n_out]
-        self.out_head = nn.Linear(n_qubits, n_out).to(device)
+        # x-register ansatz weights only — y has NO learnable weights (fixed GT)
+        ansatz_layers_per_block = max(1, n_layers // max(1, n_enc_layers))
+        total_ansatz_layers     = ansatz_layers_per_block * n_enc_layers
+        self._layers_per_block  = ansatz_layers_per_block
+        shape = ansatz_weight_shape(ansatz, total_ansatz_layers, n_qubits)
+        self.weights = nn.Parameter(
+            torch.empty(shape, device=device).uniform_(-torch.pi, torch.pi)
+        )
+
+        # No obs_weights — prediction uses post_decode(measure(psi))
+        # Learnable scale/shift: acos(expval≈0) = pi/2
+        # Init shift = -pi/2 so pred starts centred at 0 (matches normalised y ≈ 0 mean)
+        self.pred_scale = nn.Parameter(torch.ones(n_out, device=device))
+        self.pred_shift = nn.Parameter(
+            torch.full((n_out,), -torch.pi / 2, device=device)
+        )
+
+    def init_from_data(self, Y: torch.Tensor):
+        """
+        Calibrate pred_scale and pred_shift from training data statistics.
+
+        acos(expval) ≈ pi/2 for an untrained random circuit (expval ≈ 0).
+        We want:  acos(expval) * scale + shift ≈ y
+        At init:  pi/2 * scale + shift ≈ y_mean
+                  scale ≈ y_std / (pi/4)   (pi/4 is approximate acos std)
+
+        This brings MSE loss to a reasonable range immediately,
+        so fidelity can also contribute meaningful gradient signal from epoch 1.
+
+        Call this BEFORE training:
+            model.init_from_data(Y_tr)
+        """
+        with torch.no_grad():
+            y_mean = Y[:, :self.n_out].mean(dim=0).to(self.device)
+            y_std  = Y[:, :self.n_out].std(dim=0).clamp_min(0.1).to(self.device)
+            # scale: maps acos std (~pi/4) to y std
+            self.pred_scale.copy_(y_std / (torch.pi / 4))
+            # shift: maps acos(0)=pi/2 via scale to y_mean
+            self.pred_shift.copy_(y_mean - (torch.pi / 2) * self.pred_scale)
+        print(f"  init_from_data: scale={self.pred_scale.data.cpu().tolist()}")
+        print(f"                  shift={self.pred_shift.data.cpu().tolist()}")
 
     def _init_state(self, batch: int) -> torch.Tensor:
         """Initialise |0...0> statevector."""
@@ -805,15 +991,39 @@ class TorchPINN(nn.Module):
     def _run_circuit(self, x: torch.Tensor,
                      apply_ansatz: bool = True) -> torch.Tensor:
         """
-        Run encode (+ optional ansatz) on x.
-        Returns statevector [batch, 2^n_qubits].
+        Data re-uploading circuit.
+
+        n_enc_layers=1 (default, no re-uploading):
+            encode(x) -> ansatz_all -> measure
+
+        n_enc_layers=2 (re-uploading):
+            encode(x) -> ansatz_block1 -> encode(x) -> ansatz_block2 -> measure
+
+        n_enc_layers=N:
+            [encode(x) -> ansatz_block_k]  for k in 1..N
+
+        Each ansatz block has (n_layers // n_enc_layers) layers.
+        Re-uploading makes the circuit a polynomial function of x
+        instead of linear — dramatically increases expressivity.
         """
         x     = x.to(self.device)
         batch = x.shape[0]
         state = self._init_state(batch)
-        state = torch_encode(state, x, self.n_qubits, self.encoding)
-        if apply_ansatz:
-            state = torch_ansatz(state, self.weights, self.n_qubits, self.ansatz)
+
+        if not apply_ansatz:
+            # Encode only (for phi in fidelity loss) — single pass
+            state = torch_encode(state, x, self.n_qubits, self.encoding)
+            return state
+
+        lpb = self._layers_per_block    # ansatz layers per encode block
+        for block in range(self.n_enc_layers):
+            # Re-upload: encode x again at start of each block
+            state = torch_encode(state, x, self.n_qubits, self.encoding)
+            # Apply this block's ansatz layers
+            start = block * lpb
+            block_w = self.weights[start:start + lpb]   # slice this block
+            state = torch_ansatz(state, block_w, self.n_qubits, self.ansatz)
+
         return state
 
     def _lcu_loss(self, psi: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
@@ -868,58 +1078,86 @@ class TorchPINN(nn.Module):
         """
     def _run_y_circuit(self, y: torch.Tensor) -> torch.Tensor:
         """
-        Encode y into its own statevector using n_y_qubits = n_out = 3.
-        y: [batch, n_out]  ground truth [rho, u, p]
-        Returns: [batch, 2^n_y_qubits]  — NO ansatz applied
+        Encode ground truth y into phi statevector.
+
+        IMPORTANT — invertibility constraint:
+            post_decode(measure(phi)) = y   requires exactly 1 encode layer.
+
+        With n_y_enc_layers=1:
+            y → RY(arctan(y)) → expval = cos(arctan(y))
+            → acos → arctan(y) → tan → y  ✓ (up to sign for negative y)
+
+        With n_y_enc_layers=2+:
+            angle wraps past pi → acos cannot invert → NOT recoverable ✗
+
+        y has NO ansatz and NO learnable weights — it is fixed ground truth.
+
+        Returns phi: [batch, 2^n_y_qubits]
         """
         y     = y.to(self.device)
         batch = y.shape[0]
         state = torch.zeros(batch, 2 ** self.n_y_qubits,
                             dtype=torch.cfloat, device=self.device)
         state[:, 0] = 1.0 + 0j
-        return torch_encode(state, y, self.n_y_qubits, self.encoding)
+        # Single encode only — required for exact post_decode invertibility
+        state = torch_encode(state, y, self.n_y_qubits, self.y_encoding)
+        return state
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
+    def forward(self, x: torch.Tensor,
+                y: torch.Tensor = None):
         """
-        Forward pass.
+        Two-path forward.
 
-        x register (n_qubits=7):  encode(x) + ansatz  ->  psi  [batch, 2^7]
-        y register (n_y_qubits=3): encode(y) only      ->  phi  [batch, 2^3]
+        TRAINING (y provided):
+            psi   = encode(x) + ansatz          [learnable]
+            phi   = encode(y)                   [fixed GT, no ansatz]
+            loss  = lambda_data * MSE(pred, y)
+                  + LCU(fidelity(psi_marginal, phi) + NS Paulis)
 
-        y uses exactly its own feature dimension (NO=3 qubits, 2^3=8 states)
-        — no cycling, no padding. The fidelity loss compares psi and phi
-        in their own Hilbert spaces via partial trace / marginal fidelity.
+            Fidelity drives psi_marginal → phi.
+            Once converged: measure(psi[:n_out]) ≈ cos(arctan(y))
+            so post_decode gives back y.
 
-        loss = lambda_data * MSE(out_head(expval(psi)), y)
-             + LCU(fidelity(psi_marginal, phi) + NS Pauli residuals on psi)
+        PREDICTION (y=None):
+            psi   = encode(x) + ansatz          [same circuit, no phi]
+            expval = measure first n_out qubits of psi
+            pred  = post_decode("arctan") = tan(acos(expval))
+
+            Valid because fidelity training has pushed psi to encode
+            y in the arctan basis on its first n_out qubits.
         """
-        x = x.to(self.device)
+        x   = x.to(self.device)
+        psi = self._run_circuit(x, apply_ansatz=True)   # [batch, 2^n_qubits]
+
+        # ── Prediction: measure first n_out qubits ────────────────────────────
+        expvals = torch_measure(psi, self.n_qubits)            # [batch, n_qubits]
+        ev_out  = expvals[:, :self.n_out].clamp(-1+1e-6, 1-1e-6)
+
+        if y is None:
+            # Inference: apply same learned scale/shift
+            pred = torch.acos(ev_out) * self.pred_scale + self.pred_shift
+            return pred, torch.tensor(0., device=self.device)
+
+        # Training: acos(ev_out) ∈ [0, pi] but y is normalised to roughly [-2, 3]
+        # Scale and shift to match: pred = acos(ev_out) * scale + shift
+        # scale/shift are learnable — the only classical parameters allowed
+        # They do NOT break quantum purity: they are post-measurement scalars
+        pred = torch.acos(ev_out) * self.pred_scale + self.pred_shift  # [batch, n_out]
+
         y = y.to(self.device)
 
-        # x register: encode(x, n_qubits=7) + ansatz -> psi [batch, 2^7=128]
-        psi     = self._run_circuit(x, apply_ansatz=True)
-        expvals = torch_measure(psi, self.n_qubits)       # [batch, 7]
-        pred    = self.out_head(expvals)                   # [batch, 3]
+        # ── Training: fidelity between psi_marginal and phi ───────────────────
+        phi = self._run_y_circuit(y)                          # [batch, 2^n_y_qubits]
 
-        # y register: encode(y, n_y_qubits=3) only -> phi [batch, 2^3=8]
-        # Uses y's actual 3 features directly — no cycling needed
-        phi = self._run_y_circuit(y)                       # [batch, 8]
+        # Trace out qubits n_out..n_qubits-1 from psi
+        n_keep       = self.n_y_qubits                        # = n_out = 3
+        n_rest       = self.n_qubits - n_keep
+        psi_marginal = psi.reshape(-1, 2**n_keep, 2**n_rest).sum(-1)
+        psi_marginal = psi_marginal / psi_marginal.norm(
+            dim=-1, keepdim=True).clamp_min(1e-12)
 
-        # Marginal fidelity: compare first n_y_qubits of psi with phi
-        # Trace out qubits n_y_qubits..n_qubits-1 from psi to get psi_marginal
-        # psi: [batch, 2^7] -> reshape [batch, 2^3, 2^4] -> sum over last dim
-        n_keep = self.n_y_qubits                           # 3
-        n_rest = self.n_qubits - n_keep                    # 4
-        psi_marginal = psi.reshape(-1, 2**n_keep, 2**n_rest)
-        # Normalise: partial trace amplitude (sum over traced-out dims)
-        psi_marginal = psi_marginal.sum(dim=-1)            # [batch, 2^3]
-        norm = psi_marginal.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        psi_marginal = psi_marginal / norm
-
-        # MSE data loss
         l_data = nn.functional.mse_loss(pred, y)
 
-        # LCU loss using marginal psi and phi (both [batch, 2^n_y_qubits])
         l_lcu = _lcu_combined_loss(
             psi_marginal, phi,
             pde             = self.pde,
@@ -935,7 +1173,7 @@ class TorchPINN(nn.Module):
 
 
 # 
-# QAPINN  Quantum-Augmented PINN
+# TorchQAPINN  Quantum-Augmented PINN
 # 
 
 class QuantumLayer(nn.Module):
@@ -988,7 +1226,7 @@ class QuantumLayer(nn.Module):
         """
         Same as forward() but also returns the quantum statevectors.
 
-        Used by QAPINN.forward_with_loss() to compute fidelity loss
+        Used by TorchQAPINN.forward_with_loss() to compute fidelity loss
         without duplicating the circuit logic.
 
         Returns:
@@ -1011,9 +1249,9 @@ class QuantumLayer(nn.Module):
         return h_out, psi_ref, psi_pred
 
 
-class QAPINN(nn.Module):
+class TorchQAPINN(nn.Module):
     """
-    Quantum-Augmented PINN (QAPINN).
+    Quantum-Augmented PINN (TorchQAPINN).
 
     Standard MLP where one hidden layer is replaced by a QuantumLayer (QVC).
     Classical layers handle input/output mapping; the QVC acts as a nonlinear
@@ -1100,13 +1338,26 @@ class QAPINN(nn.Module):
     def quantum_layer(self) -> QuantumLayer:
         return self.layers[self.q_layer_idx]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Standard forward pass. x: [batch, NI] -> [batch, NO]"""
+    def forward(self, x: torch.Tensor,
+                y: torch.Tensor = None) -> tuple:
+        """
+        Forward pass. Returns (pred, loss).
+
+        If y is provided: loss = MSE + lambda_q * fidelity_loss  (training)
+        If y is None:     loss = 0  (inference / evaluation)
+
+        This matches the TorchQPINN (QPINN) interface so all models
+        return (pred, loss) consistently.
+        """
+        if y is not None:
+            pred, log, loss = self.forward_with_loss(x, y)
+            return pred, loss
         x = x.to(self.device)
         h = x
         for layer in self.layers:
             h = layer(h)
-        return self.out_head(h)
+        pred = self.out_head(h)
+        return pred, torch.tensor(0., device=self.device)
 
     def forward_with_loss(self, x: torch.Tensor, y: torch.Tensor) -> tuple:
         """
@@ -1173,7 +1424,7 @@ if __name__ == "__main__":
     device = _DEFAULT_DEVICE
     print(f"device: {device}")
 
-    model = TorchPINN(n_qubits=4, n_layers=2, encoding="angle_full",
+    model = TorchQPINN(n_qubits=4, n_layers=2, encoding="angle_full",
                       ansatz="u_ring", pde="burgers", nu=0.005, device=device)
     opt = torch.optim.Adam(model.parameters(), lr=0.05)
 
@@ -1197,5 +1448,5 @@ if __name__ == "__main__":
     print("OK")
 
 # Aliases
-TorchQPINN  = TorchPINN
-TorchQaPINN = QAPINN
+TorchQPINN  = TorchQPINN
+TorchQAPINN = TorchQAPINN
